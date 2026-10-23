@@ -14,15 +14,51 @@ const CALL_RE = /^\[Lore call #(\d+)\]/;
 const POSITION = { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
 const ROLE = { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
 
+// ------------------------------------------------------------------ tunables
+
+/** Rough characters-per-token ratio used for the token estimates shown to the model. */
+const CHARS_PER_TOKEN = 3.5;
+
+/** Default number of entries lore_index lists when the model gives no limit. */
+const DEFAULT_INDEX_LIMIT = 60;
+/** Hard bounds on lore_index's limit (also used by the settings input). */
+const INDEX_LIMIT_MIN = 1;
+const INDEX_LIMIT_MAX = 500;
+/** How many trigger keys lore_index shows per entry. */
+const INDEX_KEYS_SHOWN = 6;
+
+/** Default chat depth for the pinned block when it's placed "In chat @ depth". */
+const DEFAULT_PIN_DEPTH = 4;
+/** Max depth allowed in the settings input. */
+const PIN_DEPTH_MAX = 1000;
+
+/** Where the usage-instructions note is injected. */
+const RULES_POSITION = POSITION.IN_PROMPT;
+const RULES_DEPTH = 0;
+const RULES_ROLE = ROLE.SYSTEM;
+
+/** Number given to the first tool call in a chat. */
+const FIRST_CALL_NUMBER = 1;
+
+/** Indentation of the JSON shown in rerendered tool-call messages (matches SillyTavern). */
+const TOOL_MESSAGE_JSON_INDENT = 2;
+
+/** Text a purged result is replaced with; PURGED_MARKER must appear in it. */
+const PURGED_MARKER = 'content purged';
+const purgedText = (callNo, reason) => `[Lore call #${callNo} — ${PURGED_MARKER} ${reason}]`;
+
+/** Header of the pinned lore block. */
+const PIN_BLOCK_HEADER = '[Pinned lore — selected by you for the current scene]';
+
 const defaultSettings = Object.freeze({
     enabled: true,
     includeActiveBooks: true,
     extraBooks: [],
-    indexLimit: 60,
+    indexLimit: DEFAULT_INDEX_LIMIT,
     autoPurgeOnReply: true,
     injectRules: true,
     pinPosition: POSITION.IN_PROMPT,
-    pinDepth: 4,
+    pinDepth: DEFAULT_PIN_DEPTH,
     pinRole: ROLE.SYSTEM,
 });
 
@@ -52,7 +88,7 @@ function settings() {
 /** Per-chat state: call counter and pinned entries. */
 function state() {
     const meta = ctx().chatMetadata;
-    meta[MODULE] ??= { nextCall: 1, pins: {} };
+    meta[MODULE] ??= { nextCall: FIRST_CALL_NUMBER, pins: {} };
     meta[MODULE].pins ??= {};
     return meta[MODULE];
 }
@@ -69,7 +105,7 @@ function stamp(n, body) {
 }
 
 function estimateTokens(text) {
-    return Math.ceil(String(text ?? '').length / 3.5);
+    return Math.ceil(String(text ?? '').length / CHARS_PER_TOKEN);
 }
 
 function entryTitle(entry) {
@@ -165,7 +201,7 @@ function rerenderToolMessage(mesId) {
     const pre = document.createElement('pre');
     const code = document.createElement('code');
     code.classList.add('language-json');
-    code.textContent = JSON.stringify(data, null, 2);
+    code.textContent = JSON.stringify(data, null, TOOL_MESSAGE_JSON_INDENT);
     summary.textContent = `Tool calls: ${data.map(i => i.displayName || i.name).join(', ')}`;
     pre.append(code);
     details.append(summary, pre);
@@ -187,7 +223,7 @@ async function purgeCalls(targets) {
     const touched = new Set();
     for (const { mesId, inv, callNo } of loreInvocations()) {
         if (!targets.has(callNo)) continue;
-        inv.result = `[Lore call #${callNo} — content purged ${targets.get(callNo)}]`;
+        inv.result = purgedText(callNo, targets.get(callNo));
         purged.push(callNo);
         touched.add(mesId);
     }
@@ -209,7 +245,7 @@ function buildPinBlock() {
     const pins = Object.values(state().pins);
     if (!pins.length) return '';
     const body = pins.map(p => `### ${p.title} (${p.ref})\n${p.content}`).join('\n\n');
-    return `[Pinned lore — selected by you for the current scene]\n${body}`;
+    return `${PIN_BLOCK_HEADER}\n${body}`;
 }
 
 function refreshInjections() {
@@ -217,7 +253,7 @@ function refreshInjections() {
     const { setExtensionPrompt } = ctx();
     const active = s.enabled && ctx().isToolCallingSupported();
     setExtensionPrompt(PIN_PROMPT_KEY, active ? buildPinBlock() : '', Number(s.pinPosition), Number(s.pinDepth), false, Number(s.pinRole));
-    setExtensionPrompt(RULES_PROMPT_KEY, active && s.injectRules ? DEFAULT_RULES : '', POSITION.IN_PROMPT, 0, false, ROLE.SYSTEM);
+    setExtensionPrompt(RULES_PROMPT_KEY, active && s.injectRules ? DEFAULT_RULES : '', RULES_POSITION, RULES_DEPTH, false, RULES_ROLE);
     renderPinsSummary();
 }
 
@@ -239,12 +275,12 @@ async function toolIndex({ query, book, limit } = {}) {
         });
     }
 
-    const max = Math.max(1, Math.min(Number(limit) || s.indexLimit, 500));
+    const max = Math.max(INDEX_LIMIT_MIN, Math.min(Number(limit) || s.indexLimit, INDEX_LIMIT_MAX));
     const shown = entries.slice(0, max);
     if (!shown.length) return stamp(n, 'No matching lore entries.');
 
     const lines = shown.map(e => {
-        const keys = (e.key ?? []).slice(0, 6).join(', ');
+        const keys = (e.key ?? []).slice(0, INDEX_KEYS_SHOWN).join(', ');
         const pinned = pins[refOf(e)] ? ' [PINNED]' : '';
         return `- ${refOf(e)} | ${entryTitle(e)} | keys: ${keys || '—'} | ~${estimateTokens(e.content)}t${pinned}`;
     });
@@ -332,7 +368,7 @@ async function toolTheater() {
     const pins = Object.values(state().pins);
     const pinLines = pins.map(p => `- ${p.ref} | ${p.title} | ~${estimateTokens(p.content)}t`);
     const live = [...loreInvocations()]
-        .filter(x => !x.inv.result.includes('content purged'))
+        .filter(x => !x.inv.result.includes(PURGED_MARKER))
         .map(x => `- #${x.callNo} ${x.inv.name} | ~${estimateTokens(x.inv.result)}t`);
     const pinTotal = pins.reduce((sum, p) => sum + estimateTokens(p.content), 0);
     return stamp(n, [
@@ -459,7 +495,7 @@ function addSettingsUI() {
             <label class="checkbox_label"><input id="lore_theater_active" type="checkbox"><span>Expose lorebooks active in this chat</span></label>
             <label class="checkbox_label"><input id="lore_theater_autopurge" type="checkbox"><span>Auto-purge last turn's lore tool results when you send a new message (pins stay)</span></label>
             <label class="checkbox_label"><input id="lore_theater_rules" type="checkbox"><span>Inject usage instructions for the model</span></label>
-            <div class="lt-row"><span>Index result limit</span><input id="lore_theater_limit" class="text_pole" type="number" min="1" max="500"></div>
+            <div class="lt-row"><span>Index result limit</span><input id="lore_theater_limit" class="text_pole" type="number" min="${INDEX_LIMIT_MIN}" max="${INDEX_LIMIT_MAX}"></div>
             <div>Tool-only lorebooks <small>(all entries exposed, even disabled ones; keep these books inactive so they never auto-trigger)</small></div>
             <div id="lore_theater_books" class="lt-books"></div>
             <div class="lt-row">
@@ -469,7 +505,7 @@ function addSettingsUI() {
                     <option value="${POSITION.IN_PROMPT}">After main prompt / story string</option>
                     <option value="${POSITION.IN_CHAT}">In chat @ depth</option>
                 </select>
-                <span>Depth</span><input id="lore_theater_depth" class="text_pole" type="number" min="0" max="1000">
+                <span>Depth</span><input id="lore_theater_depth" class="text_pole" type="number" min="0" max="${PIN_DEPTH_MAX}">
                 <span>Role</span>
                 <select id="lore_theater_role" class="text_pole">
                     <option value="${ROLE.SYSTEM}">System</option>
@@ -529,7 +565,7 @@ async function onUserMessageSent() {
     if (!settings().autoPurgeOnReply) return;
     const targets = new Map();
     for (const { inv, callNo } of loreInvocations()) {
-        if (!inv.result.includes('content purged')) targets.set(callNo, 'automatically after reply');
+        if (!inv.result.includes(PURGED_MARKER)) targets.set(callNo, 'automatically after reply');
     }
     await purgeCalls(targets);
 }
