@@ -1,0 +1,4 @@
+#lore_theater_settings .lt-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0; }
+#lore_theater_settings .lt-books { max-height: 160px; overflow-y: auto; border: 1px solid var(--SmartThemeBorderColor); border-radius: 5px; padding: 4px 8px; }
+#lore_theater_settings .lt-pins { font-size: 0.9em; opacity: 0.85; white-space: pre-wrap; }
+#lore_theater_settings input[type="number"] { width: 6em; }

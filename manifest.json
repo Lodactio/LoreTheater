@@ -1,0 +1,13 @@
+{
+    "display_name": "Lore Theater",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "ssweepy",
+    "version": "0.1.0",
+    "homePage": "",
+    "auto_update": false,
+    "generate_interceptor": "loreTheaterInterceptor"
+}
