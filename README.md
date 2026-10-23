@@ -7,7 +7,7 @@ Lets the model build its own lore context before it replies. Using function tool
 - A model that supports tool calls.
 
 ## Install
-Copy this folder to `SillyTavern/public/scripts/extensions/third-party/SillyTavern-LoreTheater`, or install it from a Git URL in the Extensions panel. Then reload SillyTavern.
+Copy this folder to `SillyTavern/public/scripts/extensions/third-party/SillyTavern-LoreTheater`, or install it in the Extensions panel from `https://github.com/Lodactio/LoreTheater`. Then reload SillyTavern.
 
 ## Tools
 | Tool | What it does |
@@ -29,3 +29,6 @@ SillyTavern keeps tool results in the chat (`message.extra.tool_invocations[].re
 - **Auto-purge**: when you send a new message, results from the previous turn are purged and pins stay. Swiping or regenerating the last reply keeps them.
 - **Inject usage instructions**: adds a short system note that explains the workflow to the model.
 - Position, depth and role for the pinned block, plus buttons to clear pins and purge all results.
+
+## License
+AGPL-3.0. See [LICENSE](LICENSE).
