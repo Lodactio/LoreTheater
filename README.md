@@ -14,9 +14,9 @@ Copy this folder to `SillyTavern/public/scripts/extensions/third-party/SillyTave
 |---|---|
 | `lore_index` | Lists or searches entries. Shows ref (`Book#uid`), title, keys and a token estimate, without the content. |
 | `lore_fetch` | Returns the full content of the given refs. |
-| `lore_pin` / `lore_unpin` | Adds or removes entries in a persistent "Pinned lore" block (saved per chat). |
+| `lore_pin` / `lore_unpin` | Adds or removes entries in a persistent "Pinned lore" block (saved per chat). Pins store only the ref; content is read from the lorebook each time the prompt is built, so edits show up and deleted entries drop out. |
 | `lore_purge` | Replaces earlier results with a purge note, by call number or `all: true`. |
-| `lore_theater` | Shows the pins and any unpurged results with token estimates. |
+| `lore_theater` | Shows the pins (flagging any whose entry is missing), unpurged results with token estimates, and research calls used this turn. |
 
 Every result starts with `[Lore call #N]`, and that number is what the model passes to `lore_purge`. If a purge targets a call from the same tool batch, it is queued and applied once SillyTavern saves that batch.
 
@@ -27,6 +27,8 @@ SillyTavern keeps tool results in the chat (`message.extra.tool_invocations[].re
 - **Expose lorebooks active in this chat**: makes enabled entries from global, character, chat and persona books available to the tools.
 - **Tool-only lorebooks**: every entry in these books is available to the tools. Keep these books *inactive* in SillyTavern so they never trigger by keyword. Only the model can bring them in.
 - **Auto-purge**: when you send a new message, results from the previous turn are purged and pins stay. Swiping or regenerating the last reply keeps them.
+- **Research calls per turn**: how many `lore_index` / `lore_fetch` calls the model gets per turn (0 = no limit). Resets when you send a message, swipe or regenerate. Pin, unpin, purge and status calls never count, so the model can always tidy up. Default 10.
+- **Pinned token budget**: `lore_pin` refuses entries that would push the pinned block past this estimate (0 = no limit). Default 4000.
 - **Inject usage instructions**: adds a short system note that explains the workflow to the model.
 - Position, depth and role for the pinned block, plus buttons to clear pins and purge all results.
 
