@@ -50,6 +50,11 @@ const purgedText = (callNo, reason) => `[Lore call #${callNo} — ${PURGED_MARKE
 /** Header of the pinned lore block. */
 const PIN_BLOCK_HEADER = '[Pinned lore — selected by you for the current scene]';
 
+/** Default research calls (lore_index / lore_fetch) allowed per turn; 0 means unlimited. */
+const DEFAULT_RESEARCH_BUDGET = 10;
+/** Default token budget for the pinned lore block; 0 means unlimited. */
+const DEFAULT_PIN_TOKEN_BUDGET = 4000;
+
 const defaultSettings = Object.freeze({
     enabled: true,
     includeActiveBooks: true,
@@ -60,6 +65,8 @@ const defaultSettings = Object.freeze({
     pinPosition: POSITION.IN_PROMPT,
     pinDepth: DEFAULT_PIN_DEPTH,
     pinRole: ROLE.SYSTEM,
+    researchBudget: DEFAULT_RESEARCH_BUDGET,
+    pinTokenBudget: DEFAULT_PIN_TOKEN_BUDGET,
 });
 
 const DEFAULT_RULES = `[Lore Theater]
@@ -72,8 +79,23 @@ You can manage your own lore context with tools before writing your reply:
 Workflow: index → fetch candidates → pin what matters for the scene → purge the rest → write the reply.
 Do not mention these tools in your in-character reply.`;
 
+function buildRules() {
+    const s = settings();
+    const limits = [
+        s.researchBudget > 0 ? `- At most ${s.researchBudget} lore_index/lore_fetch calls per turn.` : '',
+        s.pinTokenBudget > 0 ? `- Pinned lore is capped at ~${s.pinTokenBudget} tokens; unpin to make room.` : '',
+    ].filter(Boolean);
+    return limits.length ? `${DEFAULT_RULES}\nLimits:\n${limits.join('\n')}` : DEFAULT_RULES;
+}
+
 /** Calls queued for purging because they were made in the same tool batch and are not saved to chat yet. */
 const pendingPurges = new Map();
+
+/** lore_index / lore_fetch calls made since the user's last message (or the last swipe/regenerate). */
+let researchCalls = 0;
+
+/** Generation types that start a fresh attempt at the current turn. */
+const TURN_RESTART_TYPES = ['swipe', 'regenerate'];
 
 function ctx() {
     return SillyTavern.getContext();
@@ -162,11 +184,15 @@ async function getAvailableEntries() {
     return [...byRef.values()];
 }
 
-async function findEntry(ref) {
+/** Map of ref -> entry for everything getAvailableEntries returns. */
+async function getEntryMap() {
+    return new Map((await getAvailableEntries()).map(e => [refOf(e), e]));
+}
+
+/** Finds an entry by a model-supplied ref, tolerating whitespace and leading zeros in the uid. */
+function lookupEntry(entryMap, ref) {
     const parsed = parseRef(ref);
-    if (!parsed) return null;
-    const entries = await getAvailableEntries();
-    return entries.find(e => e.world === parsed.book && Number(e.uid) === parsed.uid) ?? null;
+    return parsed ? entryMap.get(`${parsed.book}#${parsed.uid}`) ?? null : null;
 }
 
 // ------------------------------------------------------------- chat scanning
@@ -241,26 +267,60 @@ async function flushPendingPurges() {
 
 // ------------------------------------------------------------------- pinning
 
-function buildPinBlock() {
+/**
+ * Pins store only a reference; content is read from the lorebook every time the
+ * prompt is built, so edits to an entry show up in the pinned block.
+ * @returns {Promise<{found: {pin: object, entry: object, tokens: number}[], missing: object[], tokens: number}>}
+ *   `missing` holds pins whose entry was deleted, disabled or is no longer exposed to the tools.
+ */
+async function resolvePins(entryMap = null) {
     const pins = Object.values(state().pins);
-    if (!pins.length) return '';
-    const body = pins.map(p => `### ${p.title} (${p.ref})\n${p.content}`).join('\n\n');
+    const found = [];
+    const missing = [];
+    if (pins.length) {
+        entryMap ??= await getEntryMap();
+        for (const pin of pins) {
+            const entry = entryMap.get(pin.ref);
+            if (entry) found.push({ pin, entry, tokens: estimateTokens(entry.content) });
+            else missing.push(pin);
+        }
+    }
+    return { found, missing, tokens: found.reduce((sum, p) => sum + p.tokens, 0) };
+}
+
+function buildPinBlock(found) {
+    if (!found.length) return '';
+    const body = found.map(({ entry }) => `### ${entryTitle(entry)} (${refOf(entry)})\n${entry.content}`).join('\n\n');
     return `${PIN_BLOCK_HEADER}\n${body}`;
 }
 
-function refreshInjections() {
+async function refreshInjections() {
     const s = settings();
     const { setExtensionPrompt } = ctx();
     const active = s.enabled && ctx().isToolCallingSupported();
-    setExtensionPrompt(PIN_PROMPT_KEY, active ? buildPinBlock() : '', Number(s.pinPosition), Number(s.pinDepth), false, Number(s.pinRole));
-    setExtensionPrompt(RULES_PROMPT_KEY, active && s.injectRules ? DEFAULT_RULES : '', RULES_POSITION, RULES_DEPTH, false, RULES_ROLE);
-    renderPinsSummary();
+    const pins = await resolvePins();
+    setExtensionPrompt(PIN_PROMPT_KEY, active ? buildPinBlock(pins.found) : '', Number(s.pinPosition), Number(s.pinDepth), false, Number(s.pinRole));
+    setExtensionPrompt(RULES_PROMPT_KEY, active && s.injectRules ? buildRules() : '', RULES_POSITION, RULES_DEPTH, false, RULES_ROLE);
+    renderPinsSummary(pins);
+}
+
+/** Counts a research call against this turn's budget; returns an error message if the budget is spent. */
+function useResearchBudget() {
+    const budget = settings().researchBudget;
+    if (budget > 0 && researchCalls >= budget) {
+        return `Research budget for this turn is used up (${budget} of ${budget} lore_index/lore_fetch calls). `
+            + 'Work with what you have: pin what you need, purge the rest, and write your reply.';
+    }
+    researchCalls++;
+    return null;
 }
 
 // --------------------------------------------------------------------- tools
 
 async function toolIndex({ query, book, limit } = {}) {
     const n = nextCallNumber();
+    const overBudget = useResearchBudget();
+    if (overBudget) return stamp(n, overBudget);
     const s = settings();
     const pins = state().pins;
     const q = String(query ?? '').toLowerCase().trim();
@@ -290,9 +350,12 @@ async function toolIndex({ query, book, limit } = {}) {
 
 async function toolFetch({ refs } = {}) {
     const n = nextCallNumber();
+    const overBudget = useResearchBudget();
+    if (overBudget) return stamp(n, overBudget);
+    const entryMap = await getEntryMap();
     const parts = [];
     for (const ref of asArray(refs)) {
-        const entry = await findEntry(ref);
+        const entry = lookupEntry(entryMap, ref);
         parts.push(entry
             ? `### ${entryTitle(entry)} (${refOf(entry)})\n${entry.content}`
             : `### ${ref}\n(not found — check the ref with lore_index)`);
@@ -302,20 +365,30 @@ async function toolFetch({ refs } = {}) {
 
 async function toolPin({ refs } = {}) {
     const n = nextCallNumber();
+    const budget = settings().pinTokenBudget;
     const pins = state().pins;
+    const entryMap = await getEntryMap();
+    let pinnedTokens = (await resolvePins(entryMap)).tokens;
     const done = [];
     const missing = [];
+    const overBudget = [];
     for (const ref of asArray(refs)) {
-        const entry = await findEntry(ref);
+        const entry = lookupEntry(entryMap, ref);
         if (!entry) { missing.push(ref); continue; }
-        pins[refOf(entry)] = { ref: refOf(entry), title: entryTitle(entry), content: entry.content };
-        done.push(refOf(entry));
+        const key = refOf(entry);
+        if (pins[key]) { done.push(key); continue; }
+        const tokens = estimateTokens(entry.content);
+        if (budget > 0 && pinnedTokens + tokens > budget) { overBudget.push(`${key} (~${tokens}t)`); continue; }
+        pins[key] = { ref: key, title: entryTitle(entry), pinnedAt: Date.now() };
+        pinnedTokens += tokens;
+        done.push(key);
     }
     ctx().saveMetadataDebounced();
-    refreshInjections();
+    await refreshInjections();
     return stamp(n, [
         done.length ? `Pinned: ${done.join(', ')}` : '',
         missing.length ? `Not found: ${missing.join(', ')}` : '',
+        overBudget.length ? `Not pinned, over the ~${budget}t pin budget (~${pinnedTokens}t used): ${overBudget.join(', ')}. Unpin something first.` : '',
     ].filter(Boolean).join('\n') || 'Nothing pinned.');
 }
 
@@ -331,7 +404,7 @@ async function toolUnpin({ refs, all } = {}) {
         removed.forEach(ref => delete s.pins[ref]);
     }
     ctx().saveMetadataDebounced();
-    refreshInjections();
+    await refreshInjections();
     return stamp(n, removed.length ? `Unpinned: ${removed.join(', ')}` : 'Nothing unpinned.');
 }
 
@@ -365,17 +438,23 @@ async function toolPurge({ calls, all } = {}) {
 
 async function toolTheater() {
     const n = nextCallNumber();
-    const pins = Object.values(state().pins);
-    const pinLines = pins.map(p => `- ${p.ref} | ${p.title} | ~${estimateTokens(p.content)}t`);
+    const s = settings();
+    const pins = await resolvePins();
+    const pinLines = [
+        ...pins.found.map(({ pin, entry, tokens }) => `- ${pin.ref} | ${entryTitle(entry)} | ~${tokens}t`),
+        ...pins.missing.map(pin => `- ${pin.ref} | ${pin.title} | MISSING (deleted, disabled or not exposed; not injected)`),
+    ];
     const live = [...loreInvocations()]
         .filter(x => !x.inv.result.includes(PURGED_MARKER))
         .map(x => `- #${x.callNo} ${x.inv.name} | ~${estimateTokens(x.inv.result)}t`);
-    const pinTotal = pins.reduce((sum, p) => sum + estimateTokens(p.content), 0);
+    const pinBudget = s.pinTokenBudget > 0 ? ` of ~${s.pinTokenBudget}t budget` : '';
+    const research = s.researchBudget > 0 ? `${researchCalls} of ${s.researchBudget}` : `${researchCalls} (no limit)`;
     return stamp(n, [
-        `Pinned (${pins.length}, ~${pinTotal}t):`,
+        `Pinned (${pinLines.length}, ~${pins.tokens}t${pinBudget}):`,
         pinLines.join('\n') || '- none',
         `Unpurged tool results in context (${live.length}):`,
         live.join('\n') || '- none',
+        `Research calls this turn: ${research}`,
     ].join('\n'));
 }
 
@@ -459,12 +538,15 @@ function registerTools() {
 
 // ------------------------------------------------------------------ settings UI
 
-function renderPinsSummary() {
+async function renderPinsSummary(pins = null) {
     const el = document.getElementById('lore_theater_pins');
     if (!el) return;
-    let pins = [];
-    try { pins = Object.values(state().pins); } catch { /* no chat loaded */ }
-    el.textContent = pins.length ? pins.map(p => `• ${p.title} (${p.ref})`).join('\n') : 'No pinned entries in this chat.';
+    try { pins ??= await resolvePins(); } catch { /* no chat loaded */ }
+    const lines = [
+        ...(pins?.found ?? []).map(({ entry, tokens }) => `• ${entryTitle(entry)} (${refOf(entry)}) ~${tokens}t`),
+        ...(pins?.missing ?? []).map(pin => `• ${pin.title} (${pin.ref}) — missing from available lore`),
+    ];
+    el.textContent = lines.length ? lines.join('\n') : 'No pinned entries in this chat.';
 }
 
 function renderBookList() {
@@ -496,6 +578,8 @@ function addSettingsUI() {
             <label class="checkbox_label"><input id="lore_theater_autopurge" type="checkbox"><span>Auto-purge last turn's lore tool results when you send a new message (pins stay)</span></label>
             <label class="checkbox_label"><input id="lore_theater_rules" type="checkbox"><span>Inject usage instructions for the model</span></label>
             <div class="lt-row"><span>Index result limit</span><input id="lore_theater_limit" class="text_pole" type="number" min="${INDEX_LIMIT_MIN}" max="${INDEX_LIMIT_MAX}"></div>
+            <div class="lt-row"><span>Research calls per turn <small>(0 = no limit)</small></span><input id="lore_theater_research_budget" class="text_pole" type="number" min="0"></div>
+            <div class="lt-row"><span>Pinned token budget <small>(0 = no limit)</small></span><input id="lore_theater_pin_budget" class="text_pole" type="number" min="0"></div>
             <div>Tool-only lorebooks <small>(all entries exposed, even disabled ones; keep these books inactive so they never auto-trigger)</small></div>
             <div id="lore_theater_books" class="lt-books"></div>
             <div class="lt-row">
@@ -533,6 +617,8 @@ function addSettingsUI() {
     bindCheck('#lore_theater_autopurge', 'autoPurgeOnReply');
     bindCheck('#lore_theater_rules', 'injectRules');
     bindValue('#lore_theater_limit', 'indexLimit');
+    bindValue('#lore_theater_research_budget', 'researchBudget');
+    bindValue('#lore_theater_pin_budget', 'pinTokenBudget');
     bindValue('#lore_theater_pos', 'pinPosition');
     bindValue('#lore_theater_depth', 'pinDepth');
     bindValue('#lore_theater_role', 'pinRole');
@@ -554,14 +640,18 @@ function addSettingsUI() {
 
 // ---------------------------------------------------------------------- wiring
 
-globalThis.loreTheaterInterceptor = async function () {
+globalThis.loreTheaterInterceptor = async function (_chat, _contextSize, _abort, type) {
+    // Tool-loop rounds come through as 'normal', so only a swipe/regenerate restarts the turn here;
+    // a new user message resets the budget in onUserMessageSent.
+    if (TURN_RESTART_TYPES.includes(type)) researchCalls = 0;
     await flushPendingPurges();
-    refreshInjections();
+    await refreshInjections();
 };
 
 // Runs when the user sends a new message: the previous turn's theater work is done,
 // so its tool results are cleared (pins stay). Swipes/regens of the last reply keep them.
 async function onUserMessageSent() {
+    researchCalls = 0;
     if (!settings().autoPurgeOnReply) return;
     const targets = new Map();
     for (const { inv, callNo } of loreInvocations()) {
@@ -578,7 +668,7 @@ jQuery(() => {
 
     eventSource.on(eventTypes.TOOL_CALLS_PERFORMED, flushPendingPurges);
     eventSource.on(eventTypes.MESSAGE_SENT, onUserMessageSent);
-    eventSource.on(eventTypes.CHAT_CHANGED, () => { pendingPurges.clear(); refreshInjections(); });
+    eventSource.on(eventTypes.CHAT_CHANGED, () => { pendingPurges.clear(); researchCalls = 0; refreshInjections(); });
     eventSource.on(eventTypes.WORLDINFO_UPDATED, renderBookList);
     refreshInjections();
 });
