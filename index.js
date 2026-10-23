@@ -4,17 +4,29 @@
 import { getSortedEntries, loadWorldInfo, world_names } from '../../../world-info.js';
 
 const MODULE = 'lore_theater';
+const DISPLAY_NAME = 'Lore Theater';
+const LOG_PREFIX = `[${DISPLAY_NAME}]`;
 const PIN_PROMPT_KEY = 'lore_theater_pins';
 const RULES_PROMPT_KEY = 'lore_theater_rules';
 
-// Every tool result starts with this stamp so it can be purged later.
-const CALL_RE = /^\[Lore call #(\d+)\]/;
+// Every tool result starts with "[Lore call #N]" so it can be purged later.
+// A purged result keeps the label but not the closing bracket, so CALL_RE no longer matches it.
+const CALL_LABEL = 'Lore call';
+const callTag = n => `[${CALL_LABEL} #${n}]`;
+const CALL_RE = new RegExp(`^\\[${CALL_LABEL} #(\\d+)\\]`);
 
 // extension_prompt_types / extension_prompt_roles values from script.js
 const POSITION = { IN_PROMPT: 0, IN_CHAT: 1, BEFORE_PROMPT: 2 };
 const ROLE = { SYSTEM: 0, USER: 1, ASSISTANT: 2 };
 
+/** Generation types that start a fresh attempt at the current turn (tool-loop rounds arrive as 'normal'). */
+const TURN_RESTART_TYPES = ['swipe', 'regenerate'];
+
 // ------------------------------------------------------------------ tunables
+
+/** Budget/limit value that means "no limit". */
+const NO_LIMIT = 0;
+const isLimited = value => value > NO_LIMIT;
 
 /** Rough characters-per-token ratio used for the token estimates shown to the model. */
 const CHARS_PER_TOKEN = 3.5;
@@ -45,14 +57,20 @@ const TOOL_MESSAGE_JSON_INDENT = 2;
 
 /** Text a purged result is replaced with; PURGED_MARKER must appear in it. */
 const PURGED_MARKER = 'content purged';
-const purgedText = (callNo, reason) => `[Lore call #${callNo} — ${PURGED_MARKER} ${reason}]`;
+const purgedText = (callNo, reason) => `[${CALL_LABEL} #${callNo} — ${PURGED_MARKER} ${reason}]`;
+/** Reasons shown in purge notes. */
+const PURGE_REASON = Object.freeze({
+    MANUAL: 'manually',
+    AUTO: 'automatically after reply',
+    viaCall: n => `via call #${n}`,
+});
 
 /** Header of the pinned lore block. */
 const PIN_BLOCK_HEADER = '[Pinned lore — selected by you for the current scene]';
 
-/** Default research calls (lore_index / lore_fetch) allowed per turn; 0 means unlimited. */
+/** Default research calls (lore_index / lore_fetch) allowed per turn; NO_LIMIT turns the budget off. */
 const DEFAULT_RESEARCH_BUDGET = 10;
-/** Default token budget for the pinned lore block; 0 means unlimited. */
+/** Default token budget for the pinned lore block; NO_LIMIT turns the budget off. */
 const DEFAULT_PIN_TOKEN_BUDGET = 4000;
 
 const defaultSettings = Object.freeze({
@@ -72,7 +90,7 @@ const defaultSettings = Object.freeze({
 const DEFAULT_RULES = `[Lore Theater]
 You can manage your own lore context with tools before writing your reply:
 - lore_index: browse/search available lore entries (returns refs like "Book#12").
-- lore_fetch: read entries by ref. Each tool result is stamped "[Lore call #N]".
+- lore_fetch: read entries by ref. Each tool result is stamped "${callTag('N')}".
 - lore_pin / lore_unpin: keep entries permanently in context (pinned lore block), or drop them.
 - lore_purge: remove earlier tool results (by call number) from context once you've decided on them.
 - lore_theater: show what is pinned and which tool results are still occupying context.
@@ -82,8 +100,8 @@ Do not mention these tools in your in-character reply.`;
 function buildRules() {
     const s = settings();
     const limits = [
-        s.researchBudget > 0 ? `- At most ${s.researchBudget} lore_index/lore_fetch calls per turn.` : '',
-        s.pinTokenBudget > 0 ? `- Pinned lore is capped at ~${s.pinTokenBudget} tokens; unpin to make room.` : '',
+        isLimited(s.researchBudget) ? `- At most ${s.researchBudget} lore_index/lore_fetch calls per turn.` : '',
+        isLimited(s.pinTokenBudget) ? `- Pinned lore is capped at ~${s.pinTokenBudget} tokens; unpin to make room.` : '',
     ].filter(Boolean);
     return limits.length ? `${DEFAULT_RULES}\nLimits:\n${limits.join('\n')}` : DEFAULT_RULES;
 }
@@ -93,9 +111,6 @@ const pendingPurges = new Map();
 
 /** lore_index / lore_fetch calls made since the user's last message (or the last swipe/regenerate). */
 let researchCalls = 0;
-
-/** Generation types that start a fresh attempt at the current turn. */
-const TURN_RESTART_TYPES = ['swipe', 'regenerate'];
 
 function ctx() {
     return SillyTavern.getContext();
@@ -123,7 +138,7 @@ function nextCallNumber() {
 }
 
 function stamp(n, body) {
-    return `[Lore call #${n}]\n${body}`;
+    return `${callTag(n)}\n${body}`;
 }
 
 function estimateTokens(text) {
@@ -168,7 +183,7 @@ async function getAvailableEntries() {
                 if (!entry.disable) byRef.set(refOf(entry), entry);
             }
         } catch (e) {
-            console.error('[Lore Theater] Failed to read active lore', e);
+            console.error(LOG_PREFIX, 'Failed to read active lore', e);
         }
     }
 
@@ -235,7 +250,7 @@ function rerenderToolMessage(mesId) {
     try {
         ctx().updateMessageBlock(mesId, message);
     } catch (e) {
-        console.warn('[Lore Theater] Could not rerender message', mesId, e);
+        console.warn(LOG_PREFIX, 'Could not rerender message', mesId, e);
     }
 }
 
@@ -307,7 +322,7 @@ async function refreshInjections() {
 /** Counts a research call against this turn's budget; returns an error message if the budget is spent. */
 function useResearchBudget() {
     const budget = settings().researchBudget;
-    if (budget > 0 && researchCalls >= budget) {
+    if (isLimited(budget) && researchCalls >= budget) {
         return `Research budget for this turn is used up (${budget} of ${budget} lore_index/lore_fetch calls). `
             + 'Work with what you have: pin what you need, purge the rest, and write your reply.';
     }
@@ -378,7 +393,7 @@ async function toolPin({ refs } = {}) {
         const key = refOf(entry);
         if (pins[key]) { done.push(key); continue; }
         const tokens = estimateTokens(entry.content);
-        if (budget > 0 && pinnedTokens + tokens > budget) { overBudget.push(`${key} (~${tokens}t)`); continue; }
+        if (isLimited(budget) && pinnedTokens + tokens > budget) { overBudget.push(`${key} (~${tokens}t)`); continue; }
         pins[key] = { ref: key, title: entryTitle(entry), pinnedAt: Date.now() };
         pinnedTokens += tokens;
         done.push(key);
@@ -410,7 +425,7 @@ async function toolUnpin({ refs, all } = {}) {
 
 async function toolPurge({ calls, all } = {}) {
     const n = nextCallNumber();
-    const reason = `via call #${n}`;
+    const reason = PURGE_REASON.viaCall(n);
     const live = new Set([...loreInvocations()].map(x => x.callNo));
 
     const requested = all
@@ -447,8 +462,8 @@ async function toolTheater() {
     const live = [...loreInvocations()]
         .filter(x => !x.inv.result.includes(PURGED_MARKER))
         .map(x => `- #${x.callNo} ${x.inv.name} | ~${estimateTokens(x.inv.result)}t`);
-    const pinBudget = s.pinTokenBudget > 0 ? ` of ~${s.pinTokenBudget}t budget` : '';
-    const research = s.researchBudget > 0 ? `${researchCalls} of ${s.researchBudget}` : `${researchCalls} (no limit)`;
+    const pinBudget = isLimited(s.pinTokenBudget) ? ` of ~${s.pinTokenBudget}t budget` : '';
+    const research = isLimited(s.researchBudget) ? `${researchCalls} of ${s.researchBudget}` : `${researchCalls} (no limit)`;
     return stamp(n, [
         `Pinned (${pinLines.length}, ~${pins.tokens}t${pinBudget}):`,
         pinLines.join('\n') || '- none',
@@ -513,7 +528,7 @@ function registerTools() {
         {
             name: 'lore_purge',
             displayName: 'Lore: Purge',
-            description: 'Remove earlier Lore Theater tool results from context by their call number ("[Lore call #N]"). Their content is replaced with a short "purged" note.',
+            description: `Remove earlier Lore Theater tool results from context by their call number ("${callTag('N')}"). Their content is replaced with a short "purged" note.`,
             parameters: {
                 type: 'object',
                 properties: {
@@ -568,7 +583,7 @@ function addSettingsUI() {
     const html = `
     <div id="lore_theater_settings" class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
-            <b>Lore Theater</b>
+            <b>${DISPLAY_NAME}</b>
             <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
         </div>
         <div class="inline-drawer-content">
@@ -578,8 +593,8 @@ function addSettingsUI() {
             <label class="checkbox_label"><input id="lore_theater_autopurge" type="checkbox"><span>Auto-purge last turn's lore tool results when you send a new message (pins stay)</span></label>
             <label class="checkbox_label"><input id="lore_theater_rules" type="checkbox"><span>Inject usage instructions for the model</span></label>
             <div class="lt-row"><span>Index result limit</span><input id="lore_theater_limit" class="text_pole" type="number" min="${INDEX_LIMIT_MIN}" max="${INDEX_LIMIT_MAX}"></div>
-            <div class="lt-row"><span>Research calls per turn <small>(0 = no limit)</small></span><input id="lore_theater_research_budget" class="text_pole" type="number" min="0"></div>
-            <div class="lt-row"><span>Pinned token budget <small>(0 = no limit)</small></span><input id="lore_theater_pin_budget" class="text_pole" type="number" min="0"></div>
+            <div class="lt-row"><span>Research calls per turn <small>(${NO_LIMIT} = no limit)</small></span><input id="lore_theater_research_budget" class="text_pole" type="number" min="${NO_LIMIT}"></div>
+            <div class="lt-row"><span>Pinned token budget <small>(${NO_LIMIT} = no limit)</small></span><input id="lore_theater_pin_budget" class="text_pole" type="number" min="${NO_LIMIT}"></div>
             <div>Tool-only lorebooks <small>(all entries exposed, even disabled ones; keep these books inactive so they never auto-trigger)</small></div>
             <div id="lore_theater_books" class="lt-books"></div>
             <div class="lt-row">
@@ -630,9 +645,9 @@ function addSettingsUI() {
         refreshInjections();
     });
     $('#lore_theater_purge_all').on('click', async () => {
-        const targets = new Map([...loreInvocations()].map(x => [x.callNo, 'manually']));
+        const targets = new Map([...loreInvocations()].map(x => [x.callNo, PURGE_REASON.MANUAL]));
         const purged = await purgeCalls(targets);
-        toastr.info(`Purged ${purged.length} lore result(s).`, 'Lore Theater');
+        toastr.info(`Purged ${purged.length} lore result(s).`, DISPLAY_NAME);
     });
 
     renderBookList();
@@ -641,8 +656,7 @@ function addSettingsUI() {
 // ---------------------------------------------------------------------- wiring
 
 globalThis.loreTheaterInterceptor = async function (_chat, _contextSize, _abort, type) {
-    // Tool-loop rounds come through as 'normal', so only a swipe/regenerate restarts the turn here;
-    // a new user message resets the budget in onUserMessageSent.
+    // A new user message resets the budget in onUserMessageSent.
     if (TURN_RESTART_TYPES.includes(type)) researchCalls = 0;
     await flushPendingPurges();
     await refreshInjections();
@@ -655,7 +669,7 @@ async function onUserMessageSent() {
     if (!settings().autoPurgeOnReply) return;
     const targets = new Map();
     for (const { inv, callNo } of loreInvocations()) {
-        if (!inv.result.includes(PURGED_MARKER)) targets.set(callNo, 'automatically after reply');
+        if (!inv.result.includes(PURGED_MARKER)) targets.set(callNo, PURGE_REASON.AUTO);
     }
     await purgeCalls(targets);
 }
