@@ -76,6 +76,7 @@ const DEFAULT_PIN_TOKEN_BUDGET = 4000;
 const defaultSettings = Object.freeze({
     enabled: true,
     includeActiveBooks: true,
+    includeDisabledActive: false,
     extraBooks: [],
     indexLimit: DEFAULT_INDEX_LIMIT,
     autoPurgeOnReply: true,
@@ -117,9 +118,11 @@ function ctx() {
 }
 
 function settings() {
-    const store = ctx().extensionSettings;
-    store[MODULE] = Object.assign({}, defaultSettings, store[MODULE]);
-    return store[MODULE];
+    // Fill in missing keys on the stored object itself rather than replacing it: the settings UI
+    // keeps a reference to it, and a fresh copy would silently drop every change made there.
+    const s = ctx().extensionSettings[MODULE] ??= {};
+    for (const [key, value] of Object.entries(defaultSettings)) s[key] ??= structuredClone(value);
+    return s;
 }
 
 /** Per-chat state: call counter and pinned entries. */
@@ -171,7 +174,7 @@ function asArray(value) {
 
 /**
  * All entries reachable by the tools: entries from books active in this chat
- * (unless disabled) plus every entry of the extra "tool-only" books.
+ * (enabled ones only, unless includeDisabledActive is set) plus every entry of the extra "tool-only" books.
  */
 async function getAvailableEntries() {
     const s = settings();
@@ -180,7 +183,7 @@ async function getAvailableEntries() {
     if (s.includeActiveBooks) {
         try {
             for (const entry of await getSortedEntries()) {
-                if (!entry.disable) byRef.set(refOf(entry), entry);
+                if (s.includeDisabledActive || !entry.disable) byRef.set(refOf(entry), entry);
             }
         } catch (e) {
             console.error(LOG_PREFIX, 'Failed to read active lore', e);
@@ -590,6 +593,7 @@ function addSettingsUI() {
             <small>Requires Chat Completion with "Enable function calling" turned on.</small>
             <label class="checkbox_label"><input id="lore_theater_enabled" type="checkbox"><span>Enable lore tools</span></label>
             <label class="checkbox_label"><input id="lore_theater_active" type="checkbox"><span>Expose lorebooks active in this chat</span></label>
+            <label class="checkbox_label"><input id="lore_theater_active_disabled" type="checkbox"><span>Include disabled entries from those books</span></label>
             <label class="checkbox_label"><input id="lore_theater_autopurge" type="checkbox"><span>Auto-purge last turn's lore tool results when you send a new message (pins stay)</span></label>
             <label class="checkbox_label"><input id="lore_theater_rules" type="checkbox"><span>Inject usage instructions for the model</span></label>
             <div class="lt-row"><span>Index result limit</span><input id="lore_theater_limit" class="text_pole" type="number" min="${INDEX_LIMIT_MIN}" max="${INDEX_LIMIT_MAX}"></div>
@@ -629,6 +633,7 @@ function addSettingsUI() {
 
     bindCheck('#lore_theater_enabled', 'enabled');
     bindCheck('#lore_theater_active', 'includeActiveBooks');
+    bindCheck('#lore_theater_active_disabled', 'includeDisabledActive');
     bindCheck('#lore_theater_autopurge', 'autoPurgeOnReply');
     bindCheck('#lore_theater_rules', 'injectRules');
     bindValue('#lore_theater_limit', 'indexLimit');

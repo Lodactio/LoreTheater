@@ -25,6 +25,7 @@ SillyTavern keeps tool results in the chat (`message.extra.tool_invocations[].re
 
 ## Settings
 - **Expose lorebooks active in this chat**: makes enabled entries from global, character, chat and persona books available to the tools.
+- **Include disabled entries from those books**: also exposes entries you've disabled in active books, so you can switch an entry off for keyword triggering and leave it to the model. Off by default.
 - **Tool-only lorebooks**: every entry in these books is available to the tools. Keep these books *inactive* in SillyTavern so they never trigger by keyword. Only the model can bring them in.
 - **Auto-purge**: when you send a new message, results from the previous turn are purged and pins stay. Swiping or regenerating the last reply keeps them.
 - **Research calls per turn**: how many `lore_index` / `lore_fetch` calls the model gets per turn (0 = no limit). Resets when you send a message, swipe or regenerate. Pin, unpin, purge and status calls never count, so the model can always tidy up. Default 10.
